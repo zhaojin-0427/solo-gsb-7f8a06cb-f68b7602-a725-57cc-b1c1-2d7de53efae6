@@ -3,19 +3,28 @@
 /*
  * Service Worker 注册与离线状态提示。
  *
- * 状态徽标始终挂在页面顶部（#offlineStatus）：
+ * 状态徽标始终挂在页面顶部（#offlineStatus），所有提示都带版本号，
+ * 反映「本标签实际可用的版本」：
  *  - preparing 首次访问正在整套预缓存：提示「正在准备离线资源…」
- *  - ready     整套静态资源已缓存：提示「可离线使用」（含当前是否离线）
+ *  - ready     本版整套静态资源已缓存：提示「可离线使用（vN）」
  *  - error     整套缓存中有任何资源下载失败：说明具体失败原因，
- *              旧版仍在时明确「继续使用旧版」，并提供「重试」
- *  - updating  新版已下载完成，重载后生效；重载前本页保持旧版
+ *              旧版仍在时明确「继续使用旧版 vN」，并提供「重试」
+ *  - updating  新版已整套下载完成；本标签重载前仍运行并可离线使用旧版，
+ *              提示实际可用版本与待生效版本，提供「立即重载」
  *  - unsupported 非安全上下文（非 http://localhost 也非 https）或浏览器
  *              不支持 SW：只说明原因，不影响在线使用
+ *
+ * 多标签更新时，页面会在加载 / bfcache 恢复 / 控制器切换后向 SW 上报本页
+ * 资源版本（client-ready），SW 据此把每个标签绑定到对应整套缓存，并在
+ * 确认没有页面依赖旧版后才删除旧缓存。
  *
  * 草稿仍保存在 app.js 使用的 localStorage 中，与本脚本无关。
  */
 (function () {
   const SW_URL = '/sw.js';
+  // 本页面（随 HTML 一起加载的这套脚本）所属的资源版本。
+  // 必须与 public/sw.js 顶部的 CACHE_VERSION 保持一致（测试会核对）。
+  const APP_VERSION = 'v2';
   // 与 sw.js 中的缓存名前缀保持一致，仅用于在注册前同步探测是否已缓存过
   const CACHE_PREFIX = 'json-three-way-merge-static-';
 
@@ -42,12 +51,12 @@
 
     if (phase === 'preparing') {
       dot.textContent = '⏳';
-      text.textContent = '正在准备离线资源：页面、样式、全部业务脚本与本地 Ajv 必须整套缓存成功后才可离线使用…';
+      text.textContent = `正在准备 ${APP_VERSION} 版离线资源：页面、样式、全部业务脚本与本地 Ajv 必须整套缓存成功后才可离线使用…`;
       return;
     }
     if (phase === 'ready') {
       dot.textContent = '✅';
-      text.textContent = `可离线使用${net}：断网或停止容器后，重开 http://localhost:8080 仍可合并、校验、恢复草稿与导出。草稿仅保存在本浏览器本地存储中。`;
+      text.textContent = `${APP_VERSION} 版可离线使用${net}：断网或停止容器后，重开 http://localhost:8080 仍可合并、校验、恢复草稿与导出。草稿仅保存在本浏览器本地存储中。`;
       return;
     }
     if (phase === 'unsupported') {
@@ -59,8 +68,8 @@
       dot.textContent = '⚠️';
       const head = document.createElement('span');
       head.textContent = (lastIsUpdate
-        ? '新版离线资源未能整套下载，已继续使用旧版（重载前不会混用新旧脚本）。'
-        : '离线资源尚未准备完成，暂时不能离线使用。')
+        ? `新版（${APP_VERSION}）离线资源未能整套下载，本标签继续使用旧版（重载前不会混用新旧脚本），旧版离线能力不受影响。`
+        : `${APP_VERSION} 版离线资源尚未准备完成，暂时不能离线使用。`)
         + '原因：' + lastReason + ' 修复网络后可重试。';
       text.appendChild(head);
       const retry = document.createElement('button');
@@ -74,8 +83,9 @@
     // updating
     dot.textContent = '🔄';
     const head = document.createElement('span');
-    head.textContent = '新版静态资源已整套缓存完成：请重载页面（或关闭后重新打开）使用新版；'
-      + '重载前本页继续使用旧版，新旧脚本不会混用。';
+    head.textContent = `新版静态资源已整套缓存完成：当前本标签实际运行的是 ${APP_VERSION} 版（断网也仍可离线使用本版），`
+      + '重载后才切到新版；重载前新旧脚本不会混用。另一个标签可直接打开新版页面。'
+      + '全部旧标签都重载或关闭后，旧版缓存才会自动清理。';
     text.appendChild(head);
     const reload = document.createElement('button');
     reload.type = 'button';
@@ -103,6 +113,19 @@
     lastReason = reason || '未知错误';
     lastIsUpdate = Boolean(isUpdate);
     render();
+  }
+
+  // 向 SW 上报「本标签正在运行的资源版本」：SW 据此做版本绑定，
+  // 并在确认无旧版依赖者后清理旧缓存。加载、bfcache 恢复、控制器切换都报一次。
+  function announceClientReady() {
+    if (!navigator.serviceWorker) return;
+    const worker = navigator.serviceWorker.controller;
+    if (!worker) return;
+    try {
+      worker.postMessage({ type: 'client-ready', version: APP_VERSION });
+    } catch {
+      // 上报失败不影响页面功能：SW 侧还有导航绑定与保守保留旧缓存兜底
+    }
   }
 
   // 向 SW 查询整套缓存是否已就绪（页面错过 SW 的 postMessage 时的兜底）
@@ -171,6 +194,13 @@
         markError(d.reason || '有静态资源下载失败。', Boolean(d.isUpdate));
       }
     });
+    // 新 SW 接管本标签（重载后）：重新上报本页版本
+    navigator.serviceWorker.addEventListener('controllerchange', announceClientReady);
+    // bfcache 恢复时不会重新执行脚本、也不产生导航请求：
+    // 主动再报一次版本，避免 SW 把恢复的旧标签误判为已离开而删掉旧缓存
+    window.addEventListener('pageshow', (e) => {
+      if (e.persisted) announceClientReady();
+    });
   }
 
   async function retryPreparation() {
@@ -185,8 +215,8 @@
     }
   }
 
-  window.addEventListener('online', () => { offline = false; if (phase === 'ready') render(); });
-  window.addEventListener('offline', () => { offline = true; if (phase === 'ready') render(); });
+  window.addEventListener('online', () => { offline = false; if (phase === 'ready' || phase === 'updating') render(); });
+  window.addEventListener('offline', () => { offline = true; if (phase === 'ready' || phase === 'updating') render(); });
 
   (async () => {
     if (!('serviceWorker' in navigator) || !window.caches) {
@@ -235,5 +265,9 @@
     navigator.serviceWorker.ready.then((reg) => {
       if (phase === 'preparing') queryStatus(reg);
     }).catch(() => { /* 忽略：错误事件已覆盖 */ });
+
+    // 注册完成后（此时 navigator.serviceWorker.controller 可能已就绪）
+    // 上报一次本页版本
+    announceClientReady();
   })();
 })();
