@@ -15,6 +15,15 @@ const HTML_PATH = path.join(PUBLIC_DIR, 'index.html');
 
 const html = fs.readFileSync(HTML_PATH, 'utf8');
 const swSource = fs.readFileSync(SW_PATH, 'utf8');
+const offlineSource = fs.readFileSync(path.join(PUBLIC_DIR, 'offline.js'), 'utf8');
+
+test('sw.js CACHE_VERSION 与 offline.js APP_VERSION 一致（页面据此应答版本核对）', () => {
+  const swVersion = swSource.match(/const\s+CACHE_VERSION\s*=\s*'(v\d+)'/);
+  const appVersion = offlineSource.match(/const\s+APP_VERSION\s*=\s*'(v\d+)'/);
+  assert.ok(swVersion, 'sw.js 应声明 CACHE_VERSION');
+  assert.ok(appVersion, 'offline.js 应声明 APP_VERSION');
+  assert.equal(swVersion[1], appVersion[1]);
+});
 
 // 在隔离沙箱里求值 sw.js 源码，提取常量与事件注册（不执行事件回调）
 function loadSwModule() {
@@ -187,8 +196,9 @@ test('服务器：sw.js 不在对外静态目录列举之外的路径也正常�
 // ---------- install 原子性：整套成功才落缓存，任一失败即回滚 ----------
 
 // 构造可驱动事件回调的 SW 沙箱。fetchImpl(url) 决定每个资源的成败；
-// fakeCaches 模拟 CacheStorage 中各命名缓存的内容。
-function makeSwSandbox(fetchImpl, initialCaches) {
+// fakeCaches 模拟 CacheStorage 中各命名缓存的内容；
+// makeClients(makeClient) 返回模拟窗口列表，用于版本核对与旧缓存清理时机。
+function makeSwSandbox(fetchImpl, initialCaches, makeClients) {
   const installed = initialCaches || {};
   const messages = [];
   const api = { listeners: {}, messages, installed };
@@ -203,6 +213,65 @@ function makeSwSandbox(fetchImpl, initialCaches) {
     async keys() { return [...this.items.keys()].map((u) => ({ url: `http://localhost:8080${u}` })); }
   }
 
+  // 沙箱内可控的定时器：advanceTimersAndMicrotasks 让 pending 的
+  // ping 超时立刻到期，避免真实等待
+  const timers = new Map();
+  let nextTimerId = 1;
+  const sandboxTimers = {
+    setTimeout(fn) { const id = nextTimerId++; timers.set(id, fn); return id; },
+    clearTimeout(id) { timers.delete(id); },
+  };
+  async function advanceTimersAndMicrotasks() {
+    // pong 经多层微任务回调（postMessage -> port 回调），先排空微任务队列
+    // 若干轮，让应答先于下方的超时生效；再触发仍 pending 的超时
+    for (let i = 0; i < 6; i++) await Promise.resolve();
+    const pending = [...timers.values()];
+    timers.clear();
+    pending.forEach((fn) => fn());
+    for (let i = 0; i < 6; i++) await Promise.resolve();
+  }
+
+  // 模拟 MessageChannel：port2 被 transfer 给「页面」，其 postMessage
+  // 经微任务回调到 SW 持有的 port1.onmessage
+  class FakeMessageChannel {
+    constructor() {
+      this.port1 = {
+        onmessage: null,
+        close() {},
+      };
+      this.port2 = {
+        onmessage: null,
+        close() {},
+        postMessage: (data) => {
+          Promise.resolve().then(() => {
+            if (this.port1.onmessage) this.port1.onmessage({ data });
+          });
+        },
+      };
+    }
+  }
+
+  // 模拟一个窗口客户端：options.version 设定收到 version-ping 时的应答；
+  // 缺省 / null 表示「不回应」（模拟没有应答逻辑的旧版页面）
+  function makeClient(id, options) {
+    const opts = options || {};
+    return {
+      id,
+      url: 'http://localhost:8080/',
+      postMessage(data, transfer) {
+        messages.push(data);
+        if (data && data.type === 'version-ping') {
+          const port = transfer && transfer[0];
+          if (port && opts.version) {
+            Promise.resolve().then(() => port.postMessage({ type: 'version-pong', version: opts.version }));
+          }
+        }
+      },
+    };
+  }
+
+  const clientsList = makeClients ? makeClients(makeClient) : [];
+
   const sandbox = {
     URL,
     Response: class {
@@ -210,7 +279,9 @@ function makeSwSandbox(fetchImpl, initialCaches) {
       clone() { return this; }
     },
     console: { log() {}, warn() {}, error() {} },
-    MessageChannel: class {},
+    MessageChannel: FakeMessageChannel,
+    setTimeout: sandboxTimers.setTimeout,
+    clearTimeout: sandboxTimers.clearTimeout,
     fetch: async (u) => {
       const r = fetchImpl(String(u));
       if (r instanceof Error) throw r;
@@ -238,7 +309,9 @@ function makeSwSandbox(fetchImpl, initialCaches) {
     listeners: {},
     skipWaitingCalled: 0,
     skipWaiting() { selfObj.skipWaitingCalled++; },
-    clients: { matchAll: async () => [{ postMessage(m) { messages.push(m); } }] },
+    clients: {
+      async matchAll() { return clientsList; },
+    },
     registration: { active: null },
     addEventListener(type, fn) {
       selfObj.listeners[type] = selfObj.listeners[type] || [];
@@ -254,6 +327,16 @@ function makeSwSandbox(fetchImpl, initialCaches) {
   api.cacheName = sandbox.__sw.CACHE_NAME;
   api.precacheUrls = sandbox.__sw.PRECACHE_URLS;
   api.listeners = selfObj.listeners;
+  api.clientsList = clientsList;
+  api.makeClient = makeClient;
+  api.advanceTimersAndMicrotasks = advanceTimersAndMicrotasks;
+  // 向 SW 投递一条来自页面的消息（模拟 client-ready / client-closed 等）
+  api.postMessageToSw = async (data) => {
+    const event = { data, source: null, ports: [], waitUntil() {} };
+    for (const fn of selfObj.listeners.message || []) fn(event);
+    await Promise.resolve();
+    await Promise.resolve();
+  };
   api.waitFor = (event) => {
     const calls = [];
     const fakeEvent = { waitUntil(p) { calls.push(p); } };
@@ -264,7 +347,8 @@ function makeSwSandbox(fetchImpl, initialCaches) {
 }
 
 test('install：全部资源成功后整套缓存才存在，且调用 skipWaiting', async () => {
-  const api = makeSwSandbox(() => true);
+  // 一个已打开的页面（不应答版本 ping 也不影响 install）：用于接收通知消息
+  const api = makeSwSandbox(() => true, null, (makeClient) => [makeClient('page')]);
   await api.waitFor('install');
   const items = api.installed[api.cacheName];
   assert.ok(items, '应创建版本缓存');
@@ -275,7 +359,11 @@ test('install：全部资源成功后整套缓存才存在，且调用 skipWaiti
 });
 
 test('install：任一资源失败时删除整套新缓存、不 skipWaiting、并发来错误说明', async () => {
-  const api = makeSwSandbox((u) => (u.includes('/lib/patch.js') ? new Error('HTTP 500') : true));
+  const api = makeSwSandbox(
+    (u) => (u.includes('/lib/patch.js') ? new Error('HTTP 500') : true),
+    null,
+    (makeClient) => [makeClient('page')],
+  );
   await assert.rejects(() => api.waitFor('install'));
   assert.ok(!api.installed[api.cacheName], '失败后不得留下半套缓存');
   assert.equal(api.self.skipWaitingCalled, 0);
@@ -289,6 +377,7 @@ test('install（更新场景）：下载失败时旧版缓存原样保留，错�
   const api = makeSwSandbox(
     (u) => (u.includes('/app.js') ? new Error('network down') : true),
     { [oldName]: new Map([['/', {}]]) },
+    (makeClient) => [makeClient('page')],
   );
   api.self.registration.active = {}; // 有旧 SW 激活中 -> 本次属于更新
   await assert.rejects(() => api.waitFor('install'));
@@ -331,5 +420,135 @@ test('fetch：只对清单内同源 GET 缓存优先；SW 自身与清单外请�
   assert.equal(respond('cors', 'GET', 'http://localhost:8080/sw.js').handled, false);
   // 清单外路径不拦截（不做运行时缓存）
   assert.equal(respond('cors', 'GET', 'http://localhost:8080/other.json').handled, false);
+});
+
+// ---------- 旧缓存清理时机：确认没有页面依赖旧版后才删除 ----------
+
+const SW_VERSION = swSource.match(/const\s+CACHE_VERSION\s*=\s*'(v\d+)'/)[1];
+const OLD_CACHE_NAME = 'json-three-way-merge-static-v0';
+
+// 触发一次新版导航（/），随后返回导航响应的 Promise（清理在其后异步进行）
+function navigate(api) {
+  const event = {
+    request: { method: 'GET', mode: 'navigate', url: 'http://localhost:8080/' },
+    respondWith(p) { this.promise = p; },
+  };
+  for (const fn of api.self.listeners.fetch) fn(event);
+  return event.promise;
+}
+
+test('offline.js：语法合法、声明 APP_VERSION 并应答 version-ping', () => {
+  const offlinePath = path.join(PUBLIC_DIR, 'offline.js');
+  execFileSync(process.execPath, ['--check', offlinePath]);
+  assert.match(offlineSource, /const\s+APP_VERSION\s*=\s*'v\d+'/);
+  // 无条件应答 version-ping（准备中 / 出错时也不能让 SW 误删旧缓存）
+  assert.match(offlineSource, /d\.type\s*===\s*'version-ping'/);
+  assert.match(offlineSource, /type:\s*'version-pong'/);
+  // 页面加载完成与关闭时通知 SW 触发清理核对
+  assert.match(offlineSource, /'client-ready'/);
+  assert.match(offlineSource, /'client-closed'/);
+});
+
+test('旧缓存清理：无其它窗口时，新版导航后删除旧版本缓存', async () => {
+  const api = makeSwSandbox(
+    () => true,
+    { [OLD_CACHE_NAME]: new Map([['/', {}]]) },
+  );
+  await api.waitFor('install');
+  assert.ok(api.installed[OLD_CACHE_NAME], '前置：旧缓存存在');
+
+  await navigate(api);
+  await api.advanceTimersAndMicrotasks();
+
+  assert.ok(!api.installed[OLD_CACHE_NAME], '没有页面依赖旧版时应删除旧缓存');
+  assert.ok(api.installed[api.cacheName], '当前版本缓存必须保留');
+});
+
+test('旧缓存清理：仍有标签应答旧版本时，新版导航也不得删除旧缓存', async () => {
+  const api = makeSwSandbox(
+    () => true,
+    { [OLD_CACHE_NAME]: new Map([['/', {}]]) },
+    (makeClient) => [makeClient('old-tab', { version: 'v0' })],
+  );
+  await api.waitFor('install');
+
+  await navigate(api);
+  await api.advanceTimersAndMicrotasks();
+
+  assert.ok(api.installed[OLD_CACHE_NAME], '旧版标签仍开着，旧缓存必须保留');
+  assert.ok(api.installed[api.cacheName], '新版缓存同时保留（两版并存至旧标签消失）');
+});
+
+test('旧缓存清理：旧版页面没有应答逻辑（超时）时保留旧缓存；关闭后下一次清理才删除', async () => {
+  const api = makeSwSandbox(
+    () => true,
+    { [OLD_CACHE_NAME]: new Map([['/', {}]]) },
+    // 不传 version -> 永不 pong，模拟没有版本应答逻辑的旧版页面
+    (makeClient) => [makeClient('old-tab')],
+  );
+  await api.waitFor('install');
+
+  await navigate(api);
+  await api.advanceTimersAndMicrotasks();
+  assert.ok(api.installed[OLD_CACHE_NAME], '旧版页面无应答：按仍依赖旧版处理，保留缓存');
+
+  // 最后一个旧版标签关闭：窗口列表清空，页面发来 client-closed
+  api.clientsList.length = 0;
+  await api.postMessageToSw({ type: 'client-closed' });
+  await api.advanceTimersAndMicrotasks();
+  assert.ok(!api.installed[OLD_CACHE_NAME], '旧版标签全部消失后才允许删除旧缓存');
+});
+
+test('旧缓存清理：旧标签重载为新版（应答当前版本）后删除旧缓存', async () => {
+  const api = makeSwSandbox(
+    () => true,
+    { [OLD_CACHE_NAME]: new Map([['/', {}]]) },
+    (makeClient) => [makeClient('tab', { version: 'v0' })],
+  );
+  await api.waitFor('install');
+
+  await navigate(api);
+  await api.advanceTimersAndMicrotasks();
+  assert.ok(api.installed[OLD_CACHE_NAME], '前置：旧标签应答 v0，旧缓存保留');
+
+  // 同一标签重载后运行新版脚本，应答当前版本
+  api.clientsList[0] = api.makeClient('tab', { version: SW_VERSION });
+  await navigate(api);
+  await api.advanceTimersAndMicrotasks();
+  assert.ok(!api.installed[OLD_CACHE_NAME], '全部标签都在新版后删除旧缓存');
+});
+
+test('旧缓存清理：新版窗口与无应答旧窗口并存时保留；只剩新版窗口后才删除', async () => {
+  const api = makeSwSandbox(
+    () => true,
+    { [OLD_CACHE_NAME]: new Map([['/', {}]]) },
+    (makeClient) => [
+      makeClient('new-tab', { version: SW_VERSION }),
+      makeClient('old-tab'), // 旧版页面：不应答
+    ],
+  );
+  await api.waitFor('install');
+
+  await navigate(api);
+  await api.advanceTimersAndMicrotasks();
+  assert.ok(api.installed[OLD_CACHE_NAME], '多标签：一个新、一个旧（无应答）时保留旧缓存');
+
+  // 旧标签关闭（模拟关闭事件通知 + 窗口列表移除）
+  api.clientsList.splice(1, 1);
+  await api.postMessageToSw({ type: 'client-closed' });
+  await api.advanceTimersAndMicrotasks();
+  assert.ok(!api.installed[OLD_CACHE_NAME], '旧标签关闭后清理旧缓存');
+});
+
+test('fetch：只读本 SW 自己版本的缓存，旧缓存同路径条目不会被新版页面取用', async () => {
+  // 旧缓存里的 / 标记为旧响应；新版缓存已整套安装。新版导航必须返回新版条目
+  const oldEntry = { from: 'old-cache' };
+  const api = makeSwSandbox(
+    () => true,
+    { [OLD_CACHE_NAME]: new Map([['/', oldEntry]]) },
+  );
+  await api.waitFor('install');
+  const resp = await navigate(api);
+  assert.notEqual(resp, oldEntry, '新版页面不得取到旧缓存中的资源');
 });
 

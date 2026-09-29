@@ -7,21 +7,33 @@
  *  - 静态资源按 CACHE_VERSION 整体缓存：install 时必须把 PRECACHE_URLS
  *    全部下载成功，才写入整套缓存并提示「可离线使用」；任一资源失败则
  *    删除本次新建的缓存、安装失败，继续沿用旧版本（首次安装则无缓存可用）。
+ *    因此新版下载中断时，旧版整套缓存原封不动，旧页面离线续用不受影响。
  *  - 不调用 clients.claim()：已打开的页面在重载前始终由旧 SW 控制、
- *    使用旧版资源，绝不混用新旧脚本；重载后才落到新版本。
- *  - 旧版缓存不在 activate 时立即删除——仍打开旧版页面（甚至断网）时
- *    旧 SW 还要靠它响应；直到新 SW 第一次处理新版文档的导航请求时，
- *    才清掉其它版本缓存（此刻加载的必然是同版 HTML + 同版资源）。
- *  - fetch 只对 install 时缓存的那套静态资源走缓存优先，绝不临时写入
- *    其它响应——缓存里只可能有「整套成功」的资源。
+ *    使用旧版资源，绝不混用新旧脚本；重载（或新开标签导航）后才落到新版本。
+ *  - 旧版缓存既不在 activate 时删除，也不在「第一次新版导航」时删除——
+ *    另一标签页可能仍停留在旧版页面（由已 redundant 的旧 SW 控制，甚至
+ *    已经断网），删掉旧缓存会让它后续请求离线失败。本 SW 只在确认
+ *    「没有任何页面仍依赖旧版」后才清理旧缓存：
+ *      · activate、每次新版文档导航、页面上报 / 关闭时都尝试一次清理；
+ *      · 清理前向所有打开中的窗口（含不由本 SW 控制的旧版页面）询问
+ *        正在运行的版本（version-ping），页面用 offline.js 中的
+ *        APP_VERSION 应答（version-pong）；
+ *      · 只有所有窗口都应答为当前版本（或根本没有窗口）才删除旧缓存；
+ *        应答为旧版本、或超时未应答的旧版页面（旧脚本没有应答逻辑）
+ *        都视为仍有依赖，保留旧缓存，下次再试。
+ *  - fetch 只对 install 时缓存的那套静态资源走缓存优先，且只读本 SW
+ *    自己版本的缓存（caches.match 限定 CACHE_NAME），绝不临时写入其它
+ *    响应——缓存里只可能有「整套成功」的资源，新旧页面不可能混用资源。
  *  - 草稿仍保存在页面的 localStorage，SW 不缓存任何用户数据。
  *
  * 升级静态资源后必须把 CACHE_VERSION 加 1（内容变化也会触发浏览器发现
- * 新 SW），测试 test/offline.test.js 会核对清单与页面引用一致。
+ * 新 SW），同时把 public/offline.js 中的 APP_VERSION 改为同一版本号；
+ * 测试 test/offline.test.js 会核对两处版本、清单与页面引用一致。
  */
 
-const CACHE_VERSION = 'v1';
+const CACHE_VERSION = 'v2';
 const CACHE_NAME = 'json-three-way-merge-static-' + CACHE_VERSION;
+const CACHE_PREFIX = 'json-three-way-merge-static-';
 const SW_PATH = '/sw.js';
 
 // 离线运行所需的全部静态资源：页面、样式、全部业务脚本、本地打包的 Ajv。
@@ -46,6 +58,9 @@ const PRECACHE_URLS = [
 ];
 
 const PRECACHE_SET = new Set(PRECACHE_URLS);
+
+// 旧版页面没有应答逻辑：ping 超过该时长未回 pong 即按「仍依赖旧版」处理
+const PING_TIMEOUT_MS = 1500;
 
 // 把 fetch 的失败原因整理成中文说明，供页面提示「为什么还不能离线」
 function describeFailure(failedUrl, err) {
@@ -80,7 +95,8 @@ self.addEventListener('install', (event) => {
         // Response 流只能消费一次：clone 一份留给后续 put
         fetched.push([url, resp.clone()]);
       } catch (err) {
-        // 下载阶段失败：cache 尚未写入任何条目；保险起见整个删掉
+        // 下载阶段失败：cache 尚未写入任何条目；保险起见整个删掉。
+        // 旧版本缓存是另一个 CACHE_NAME，这里绝不动它，旧版可继续离线。
         await caches.delete(CACHE_NAME).catch(() => {});
         await notifyPages({
           type: 'precache-error',
@@ -113,38 +129,84 @@ self.addEventListener('install', (event) => {
       isUpdate: Boolean(self.registration.active),
     });
 
-    // 跳过 waiting：下次导航 / 重载即由新 SW 接管；不调用 claim，
+    // 跳过 waiting：下次导航 / 新开标签即由新 SW 接管；不调用 claim，
     // 因此已打开的页面在重载前不会收到新版资源。
     self.skipWaiting();
   })());
 });
 
-// activate：不 claim 现有页面，也不立即删旧缓存——旧版页面在重载前
-// 仍由旧 SW 控制，其离线响应还要依赖旧版缓存；旧缓存延迟到新 SW
-// 第一次处理新版文档导航请求时再清理（见 fetch 处理）
-self.addEventListener('activate', () => {
-  // 无需 event.waitUntil：没有必须在激活阶段完成的异步工作
+// activate：不 claim 现有页面，也不删旧缓存——旧版页面在重载前仍由
+// 旧 SW 控制，其离线响应还要依赖旧版缓存；只尝试一次「确认无人依赖后」
+// 的清理（清理条件不满足就保留，见 sweepStaleCaches）。
+self.addEventListener('activate', (event) => {
+  // 尽力而为：条件不满足（仍有旧版页面）就保留旧缓存，导航 / 页面通知会再试
+  event.waitUntil(sweepStaleCaches().catch(() => {}));
 });
 
-// 新 SW 第一次响应新版文档导航后，旧版页面已不可能再由本 SW 服务，
-// 此刻删除其它版本缓存是安全的
-let staleCachesSwept = false;
+// 确认没有任何打开中的页面仍依赖旧版后，才删除其它版本的缓存。
+// 判定方式：向所有窗口（包括不由本 SW 控制的旧版页面）询问运行版本，
+// 全部应答为当前版本（或无窗口）才可清理；旧版本应答 / 超时未应答 /
+// 查询出错都保留旧缓存，等待下次触发。
+let sweeping = false;
+
 async function sweepStaleCaches() {
-  if (staleCachesSwept) return;
-  staleCachesSwept = true;
+  if (sweeping) return;
+  sweeping = true;
   try {
+    let clients;
+    try {
+      clients = await self.clients.matchAll({ includeUncontrolled: true, type: 'window' });
+    } catch {
+      return; // 查询不到页面状态时保守保留旧缓存
+    }
+
+    const versions = await Promise.all(clients.map(pingClientVersion));
+    // 任何一个窗口仍在旧版（或无法确认版本），旧缓存就继续保留
+    if (versions.some((v) => v !== CACHE_VERSION)) return;
+
     const names = await caches.keys();
     await Promise.all(names
-      .filter((name) => name.startsWith('json-three-way-merge-static-') && name !== CACHE_NAME)
+      .filter((name) => name.startsWith(CACHE_PREFIX) && name !== CACHE_NAME)
       .map((name) => caches.delete(name)));
   } catch {
-    // 清理失败不影响响应；下次导航会再试
-    staleCachesSwept = false;
+    // 清理失败不影响响应；下次导航 / 页面上报会再试
+  } finally {
+    sweeping = false;
   }
 }
 
+// 询问单个窗口正在运行的资源版本。新版页面（offline.js）应答
+// APP_VERSION；旧版页面无应答逻辑，超时后返回 null —— 一律视为旧版。
+function pingClientVersion(client) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      resolve(null);
+    }, PING_TIMEOUT_MS);
+    const messageChannel = new MessageChannel();
+    messageChannel.port1.onmessage = (event) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      const data = (event && event.data) || {};
+      resolve(data.type === 'version-pong' && typeof data.version === 'string'
+        ? data.version
+        : null);
+      try { messageChannel.port1.close(); } catch { /* 忽略 */ }
+    };
+    try {
+      client.postMessage({ type: 'version-ping' }, [messageChannel.port2]);
+    } catch {
+      clearTimeout(timer);
+      resolve(null);
+    }
+  });
+}
+
 // fetch：仅处理同源 GET 且属于整套清单的静态资源，缓存优先；
-// 清单外请求一律直接走网络，SW 不缓存任何其它内容
+// 且只读本 SW 自己版本的缓存，绝不运行时写入任何内容
 self.addEventListener('fetch', (event) => {
   const req = event.request;
   if (req.method !== 'GET') return;
@@ -159,10 +221,11 @@ self.addEventListener('fetch', (event) => {
   if (!PRECACHE_SET.has(key) && !PRECACHE_SET.has(url.pathname)) return;
 
   event.respondWith((async () => {
+    // 只可能命中本 SW 版本（与 install 写入的是同一套资源）的缓存
     const cached = await caches.match(req, { ignoreSearch: false, cacheName: CACHE_NAME });
     if (cached) {
-      // 确认旧版页面已全部切走后再清理旧缓存：在导航请求（HTML 文档）
-      // 上触发，意味着浏览器正在加载本版页面，同版资源会随之一起来自本缓存
+      // 新版文档导航完成后再尝试清理：此刻加载的必然是同版 HTML + 同版
+      // 资源；但其它标签页可能仍在旧版，清理仍以「全部窗口版本确认」为准
       if (req.mode === 'navigate') sweepStaleCaches();
       return cached;
     }
@@ -174,9 +237,17 @@ self.addEventListener('fetch', (event) => {
   })());
 });
 
-// 页面查询当前整版缓存是否完整可用
+// 页面消息：加载 / 关闭通知（触发清理核对）与缓存完整性状态查询
 self.addEventListener('message', (event) => {
   const data = event.data || {};
+
+  // 页面加载完成（client-ready）或关闭 / 跳走（client-closed）后都再试一次：
+  // 尤其最后一个旧版页面关闭时，旧缓存由此被及时回收
+  if (data.type === 'client-ready' || data.type === 'client-closed') {
+    event.waitUntil(sweepStaleCaches().catch(() => {}));
+    return;
+  }
+
   if (data.type !== 'offline-status') return;
   event.waitUntil((async () => {
     let ok = false;
